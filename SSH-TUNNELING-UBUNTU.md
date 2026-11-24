@@ -1,124 +1,139 @@
-# Configure a Reverse SSH Tunnel for Ubuntu Internet Access
+# Internet Access for an Offline Server via SSH Reverse SOCKS Proxy
 
-## Overview
+Give an internet-less server (e.g. `rancher` at `192.168.14.38`) internet access through your workstation (e.g. Kali `nuke`) using a single SSH command.
 
-A reverse SSH tunnel allows an Ubuntu machine without direct internet access to use another computer's internet connection through a SOCKS5 proxy.
-
-This is useful when:
-- Your Ubuntu VM has no internet access.
-- Your PC has internet access, but Ubuntu does not.
-- You need to download packages using APT.
-- You need to install software and dependencies on an offline Ubuntu server.
-
-## 1. Establish the Reverse SSH Tunnel
-
-On your PC (Windows PowerShell, Linux terminal, or macOS terminal), execute:
-
-```bash
-ssh -R 1080:127.0.0.1:1080 ubuntuuser@<ubuntu-ip>
+```
+[rancher: apt/curl/docker] --> 127.0.0.1:1080 (SOCKS5) ==SSH tunnel==> [Kali] --> Internet
 ```
 
-Replace:
-- `ubuntuuser` with your Ubuntu username.
-- `<ubuntu-ip>` with your Ubuntu machine's IP address.
+## Requirements
 
-Leave this terminal open.
+- OpenSSH **7.6+** on the client (Kali). Check with `ssh -V`.
+- The workstation has internet access; the server can be reached over SSH.
+- `AllowTcpForwarding` is not disabled in the server's `/etc/ssh/sshd_config` (it is enabled by default).
 
-**Important:** The command above forwards a remote port to a local port. To provide an actual SOCKS5 proxy, start a SOCKS proxy on your PC first.
+---
 
-Open another terminal on your PC and execute:
-
-```bash
-ssh -D 1080 -N localhost
-```
-
-A more practical arrangement is to use a local SOCKS5 proxy application such as `ssh -D`, then establish the reverse forwarding with a separate SSH connection. Ensure the ports do not conflict.
-
-## 2. Test the Tunnel
-
-On Ubuntu, execute:
+## 1. Open the tunnel (on Kali)
 
 ```bash
-curl -x socks5h://127.0.0.1:1080 -I https://ubuntu.com
+ssh -R 1080 root1@192.168.14.38
 ```
 
-A successful connection should return an HTTP response such as:
+`-R 1080` with no destination after it tells SSH to start a **SOCKS5 proxy on the server** at `127.0.0.1:1080`. Traffic sent to it goes out through Kali.
 
-```text
-HTTP/2 200
-```
-
-## 3. Configure APT to Use the SOCKS5 Proxy
-
-APT supports HTTP and HTTPS proxies natively, but not SOCKS5 directly.
-
-Install ProxyChains:
+To keep only the tunnel open, without a shell:
 
 ```bash
+ssh -N -R 1080 root1@192.168.14.38
+```
+
+> ✅ The tunnel is up if the login shows **no** `Warning: remote port forwarding failed for listen port 1080`.
+
+---
+
+## 2. Test it (on the server)
+
+```bash
+curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
+```
+
+This should print your workstation's public IP.
+`socks5h` (with the **h**) makes DNS lookups happen on the Kali side as well, which matters when the server has no working DNS.
+
+---
+
+## 3. Point tools at the proxy (on the server)
+
+### apt
+
+```bash
+echo 'Acquire::http::Proxy "socks5h://127.0.0.1:1080";
+Acquire::https::Proxy "socks5h://127.0.0.1:1080";' | sudo tee /etc/apt/apt.conf.d/99proxy
+
 sudo apt update
-sudo apt install -y proxychains4
 ```
 
-Edit its configuration:
+Remove the file when you no longer need it: `sudo rm /etc/apt/apt.conf.d/99proxy`
+
+### Shell (curl, scripts, most CLI tools)
 
 ```bash
-sudo nano /etc/proxychains4.conf
+export ALL_PROXY=socks5h://127.0.0.1:1080
+export http_proxy=socks5h://127.0.0.1:1080
+export https_proxy=socks5h://127.0.0.1:1080
+export no_proxy=localhost,127.0.0.1,192.168.14.0/24
 ```
 
-At the bottom, configure:
+> `wget` does not support SOCKS, so use `curl` for downloads.
 
-```ini
-[ProxyList]
-socks5 127.0.0.1 1080
-```
-
-Test connectivity:
+### Docker (image pulls)
 
 ```bash
-proxychains4 curl -I https://ubuntu.com
+sudo mkdir -p /etc/systemd/system/docker.service.d
+printf '[Service]\nEnvironment="HTTPS_PROXY=socks5://127.0.0.1:1080" "HTTP_PROXY=socks5://127.0.0.1:1080" "NO_PROXY=localhost,127.0.0.1,192.168.14.0/24"\n' \
+  | sudo tee /etc/systemd/system/docker.service.d/proxy.conf
+
+sudo systemctl daemon-reload
+sudo systemctl restart docker
 ```
 
-## 4. Install Packages Through the Proxy
+---
 
-Run APT commands through ProxyChains:
+## Troubleshooting
+
+### `Warning: remote port forwarding failed for listen port 1080`
+
+Something on the server, usually an old SSH session, already holds port 1080.
+
+**Option A: use another port**
 
 ```bash
-sudo proxychains4 apt update
+ssh -R 1081 root1@192.168.14.38
+# then use 127.0.0.1:1081 everywhere above
 ```
 
-For package installation:
+**Option B: free port 1080 (on the server)**
 
 ```bash
-sudo proxychains4 apt install -y gcc make
+# See which process owns the port (sudo is needed to show the PID)
+sudo ss -tlnp | grep 1080
+
+# Kill it by PID
+sudo kill <pid>
+
+# ...or find and kill it in one step
+sudo fuser -k 1080/tcp
+
+# Check: this should print nothing
+ss -tnl | grep 1080
 ```
 
-**Note:** Running ProxyChains with `sudo` can require additional configuration depending on the system. If APT does not work through ProxyChains, use an HTTP proxy bridge such as Privoxy between SOCKS5 and APT.
+> ⚠️ The process holding the port is an `sshd` belonging to one of your SSH sessions. Killing it may drop your current connection. Reconnect afterwards.
 
-## 5. Remove the Proxy Configuration
+Then reconnect from Kali with `ssh -R 1080 root1@192.168.14.38`.
 
-When finished, edit:
+### `curl: (97) Recv failure: Connection reset by peer`
+
+The port on the server is a plain forward (e.g. from `-R 1080:127.0.0.1:1080`) to a port on Kali where nothing is listening. Free the port as described above and reconnect using the `-R 1080` form.
+
+### `ssh -D 1080 -N localhost` → `Connection refused`
+
+That method needs an SSH server running on Kali. You don't need it, because `ssh -R 1080` does the same job in one step. If you still want the two-step method:
 
 ```bash
-sudo nano /etc/proxychains4.conf
+sudo systemctl start ssh            # on Kali
+ssh -D 1080 -N localhost            # local SOCKS proxy on Kali
+ssh -R 1080:127.0.0.1:1080 root1@192.168.14.38   # forward it to the server
 ```
 
-Remove or comment out the SOCKS5 entry if you no longer need it.
+---
 
-## 6. Alternative: Use NAT Networking
+## Notes
 
-If Ubuntu is running inside a virtual machine, NAT networking is usually the simplest option.
-
-NAT allows the VM to share the host computer's internet connection without manually establishing an SSH tunnel.
-
-## Summary
-
-| Component | Purpose |
-|---|---|
-| SSH | Establishes the secure connection |
-| SSH Reverse Forwarding | Exposes a port on Ubuntu |
-| SOCKS5 | Forwards network traffic |
-| ProxyChains | Routes supported applications through SOCKS5 |
-| APT | Installs Ubuntu packages |
-| NAT | Alternative VM internet connectivity |
-
-**Final Note:** Keep the SSH tunnel active while downloading packages. Close it when you finish.
+- The proxy works **only while the SSH session is open**. Closing it cuts off the server's internet access.
+- For a long-running tunnel, run it in `tmux`/`screen`, or use `autossh`:
+  ```bash
+  autossh -M 0 -N -R 1080 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 root1@192.168.14.38
+  ```
+- Remove proxy settings (apt file, Docker drop-in, exported variables) once the server has direct internet access.
